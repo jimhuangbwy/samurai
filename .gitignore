@@ -164,3 +164,6 @@ visualization/*
 
 # For Testing
 demo/
+
+# checkpoints
+sam2
