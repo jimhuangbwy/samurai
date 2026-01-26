@@ -7,6 +7,8 @@ import cv2
 import torch
 import gc
 import sys
+import tempfile
+import shutil
 sys.path.append("./sam2")
 from sam2.build_sam import build_sam2_video_predictor
 
@@ -23,6 +25,9 @@ COLORS = [
     (0, 128, 255),  # Orange-red
     (128, 255, 0),  # Light green
 ]
+
+# Default chunk size (number of frames per chunk)
+DEFAULT_CHUNK_SIZE = 500
 
 
 def load_txt_multi(gt_path, bbox_format="xywh"):
@@ -99,164 +104,126 @@ def prepare_frames_or_path(video_path):
         raise ValueError("Invalid video_path format. Should be .mp4 or a directory of jpg frames.")
 
 
-def main(args):
-    print("=" * 60)
-    print("[DEBUG] Starting multi-object tracking")
-    print("=" * 60)
-    print(f"[DEBUG] Arguments:")
-    print(f"[DEBUG]   video_path: {args.video_path}")
-    print(f"[DEBUG]   txt_path: {args.txt_path}")
-    print(f"[DEBUG]   bbox_format: {args.bbox_format}")
-    print(f"[DEBUG]   model_path: {args.model_path}")
-    print(f"[DEBUG]   video_output_path: {args.video_output_path}")
-    print(f"[DEBUG]   result_path: {args.result_path}")
-    print(f"[DEBUG]   csv_path: {args.csv_path}")
-    print(f"[DEBUG]   save_to_video: {args.save_to_video}")
-    print("-" * 60)
-
-    print("\n[DEBUG] Step 1: Loading model configuration...")
-    model_cfg = determine_model_cfg(args.model_path)
-
-    print("\n[DEBUG] Step 2: Building SAM2 video predictor...")
-    print(f"[DEBUG] Using device: cuda:0")
-    predictor = build_sam2_video_predictor(model_cfg, args.model_path, device="cuda:0")
-    print("[DEBUG] Predictor built successfully")
-
-    print("\n[DEBUG] Step 3: Preparing video frames/path...")
-    frames_or_path = prepare_frames_or_path(args.video_path)
-
-    print("\n[DEBUG] Step 4: Loading bounding boxes...")
-    prompts = load_txt_multi(args.txt_path, args.bbox_format)
-
-    num_objects = len(prompts)
-    print(f"\n[DEBUG] Step 5: Ready to track {num_objects} objects")
-    print("-" * 60)
-
-    # Results storage: frame_idx -> {obj_id: bbox}
-    all_results = {}
-
-    frame_rate = 30
-    loaded_frames = None
-    height, width = None, None
-
-    # Load frames if saving to video
-    if args.save_to_video:
-        print("\n[DEBUG] Step 6: Loading frames for video output...")
-        if osp.isdir(args.video_path):
-            print(f"[DEBUG] Loading frames from directory: {args.video_path}")
-            frames = sorted([osp.join(args.video_path, f) for f in os.listdir(args.video_path)
-                           if f.endswith((".jpg", ".jpeg", ".JPG", ".JPEG"))])
-            print(f"[DEBUG] Found {len(frames)} image files")
-            loaded_frames = []
-            for i, frame_path in enumerate(frames):
-                frame = cv2.imread(frame_path)
-                if frame is None:
-                    print(f"[DEBUG] WARNING: Failed to load frame: {frame_path}")
-                loaded_frames.append(frame)
-                if (i + 1) % 100 == 0:
-                    print(f"[DEBUG] Loaded {i + 1}/{len(frames)} frames...")
-            height, width = loaded_frames[0].shape[:2]
+def get_video_info(video_path):
+    """Get video frame count and dimensions."""
+    if osp.isdir(video_path):
+        frames = sorted([f for f in os.listdir(video_path)
+                        if f.endswith((".jpg", ".jpeg", ".JPG", ".JPEG"))])
+        num_frames = len(frames)
+        if num_frames > 0:
+            first_frame = cv2.imread(osp.join(video_path, frames[0]))
+            height, width = first_frame.shape[:2]
+            frame_rate = 30  # Default for image sequences
         else:
-            print(f"[DEBUG] Loading frames from video file: {args.video_path}")
-            cap = cv2.VideoCapture(args.video_path)
-            if not cap.isOpened():
-                raise ValueError(f"Failed to open video file: {args.video_path}")
-            frame_rate = cap.get(cv2.CAP_PROP_FPS)
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            print(f"[DEBUG] Video properties: {total_frames} total frames, {frame_rate} FPS")
-            loaded_frames = []
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                loaded_frames.append(frame)
-                if len(loaded_frames) % 100 == 0:
-                    print(f"[DEBUG] Loaded {len(loaded_frames)}/{total_frames} frames...")
-            cap.release()
-            print(f"[DEBUG] Video capture released")
-            height, width = loaded_frames[0].shape[:2]
-
-            if len(loaded_frames) == 0:
-                raise ValueError("No frames were loaded from the video.")
-
-        print(f"[DEBUG] Successfully loaded {len(loaded_frames)} frames ({width}x{height}) at {frame_rate} FPS")
+            raise ValueError("No frames found in directory")
     else:
-        print("\n[DEBUG] Step 6: Skipping frame loading (save_to_video=False)")
+        cap = cv2.VideoCapture(video_path)
+        num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        frame_rate = cap.get(cv2.CAP_PROP_FPS)
+        cap.release()
+    return num_frames, width, height, frame_rate
 
-    # Setup video writer
-    out = None
-    if args.save_to_video:
-        print(f"\n[DEBUG] Step 7: Setting up video writer...")
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(args.video_output_path, fourcc, frame_rate, (width, height))
-        if out.isOpened():
-            print(f"[DEBUG] Video writer initialized: {args.video_output_path}")
-            print(f"[DEBUG]   Codec: mp4v, FPS: {frame_rate}, Size: {width}x{height}")
-        else:
-            print(f"[DEBUG] WARNING: Video writer may not be properly initialized")
+
+def extract_chunk_frames(video_path, start_frame, end_frame, temp_dir):
+    """Extract frames from video/directory for a specific chunk into a temp directory."""
+    os.makedirs(temp_dir, exist_ok=True)
+
+    if osp.isdir(video_path):
+        # Copy frames from source directory
+        frames = sorted([f for f in os.listdir(video_path)
+                        if f.endswith((".jpg", ".jpeg", ".JPG", ".JPEG"))])
+        for i, frame_idx in enumerate(range(start_frame, end_frame)):
+            if frame_idx < len(frames):
+                src = osp.join(video_path, frames[frame_idx])
+                dst = osp.join(temp_dir, f"{i:05d}.jpg")
+                shutil.copy2(src, dst)
     else:
-        print(f"\n[DEBUG] Step 7: Skipping video writer setup (save_to_video=False)")
+        # Extract frames from video file
+        cap = cv2.VideoCapture(video_path)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        for i in range(end_frame - start_frame):
+            ret, frame = cap.read()
+            if not ret:
+                break
+            cv2.imwrite(osp.join(temp_dir, f"{i:05d}.jpg"), frame)
+        cap.release()
 
-    print(f"\n[DEBUG] Step 8: Initializing predictor state...")
-    print(f"[DEBUG] Using torch.inference_mode() and torch.autocast('cuda', dtype=torch.float16)")
+    return temp_dir
+
+
+def load_chunk_frames_for_vis(video_path, start_frame, end_frame):
+    """Load frames for visualization."""
+    frames = []
+    if osp.isdir(video_path):
+        frame_files = sorted([f for f in os.listdir(video_path)
+                             if f.endswith((".jpg", ".jpeg", ".JPG", ".JPEG"))])
+        for frame_idx in range(start_frame, end_frame):
+            if frame_idx < len(frame_files):
+                frame = cv2.imread(osp.join(video_path, frame_files[frame_idx]))
+                frames.append(frame)
+    else:
+        cap = cv2.VideoCapture(video_path)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        for _ in range(end_frame - start_frame):
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frames.append(frame)
+        cap.release()
+    return frames
+
+
+def process_chunk(predictor, chunk_path, prompts, chunk_start_frame, save_to_video,
+                  video_frames=None, height=None, width=None):
+    """Process a single chunk of video and return results and updated prompts for next chunk."""
+    chunk_results = {}
 
     with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
-        print(f"[DEBUG] Calling predictor.init_state() with offload_video_to_cpu=True...")
-        state = predictor.init_state(frames_or_path, offload_video_to_cpu=True)
-        print(f"[DEBUG] Predictor state initialized successfully")
+        state = predictor.init_state(chunk_path, offload_video_to_cpu=True)
 
-        # Add all objects to track
-        print(f"\n[DEBUG] Step 9: Adding {len(prompts)} objects to track...")
+        # Add all objects to track with their current bboxes
         for obj_id, (bbox, label) in prompts.items():
-            print(f"[DEBUG] Adding object {obj_id}: bbox={bbox}")
             _, _, masks = predictor.add_new_points_or_box(state, box=bbox, frame_idx=0, obj_id=obj_id)
-            print(f"[DEBUG]   Object {obj_id} added, initial mask shape: {masks.shape if masks is not None else 'None'}")
 
-        # Propagate through video
-        print(f"\n[DEBUG] Step 10: Propagating through video...")
-        print(f"[DEBUG] Starting propagate_in_video()...")
-        frame_count = 0
+        # Propagate through chunk
+        last_bboxes = {}  # Store last valid bbox for each object
         for frame_idx, object_ids, masks in predictor.propagate_in_video(state):
-            frame_count += 1
+            global_frame_idx = chunk_start_frame + frame_idx
             mask_to_vis = {}
             bbox_to_vis = {}
             frame_results = {}
-
-            # Detailed logging for first few frames
-            if frame_idx < 5:
-                print(f"[DEBUG] Frame {frame_idx}: processing {len(object_ids)} objects")
-                print(f"[DEBUG]   object_ids: {list(object_ids)}")
-                print(f"[DEBUG]   masks shape: {masks.shape}")
 
             for obj_id, mask in zip(object_ids, masks):
                 mask = mask[0].cpu().numpy()
                 mask = mask > 0.0
                 non_zero_indices = np.argwhere(mask)
-                mask_area = len(non_zero_indices)
 
                 if len(non_zero_indices) == 0:
-                    bbox = [0, 0, 0, 0]
-                    if frame_idx < 5:
-                        print(f"[DEBUG]   Object {obj_id}: NO MASK (empty)")
+                    # Use last known bbox if available
+                    if obj_id in last_bboxes:
+                        bbox = last_bboxes[obj_id]
+                    else:
+                        bbox = [0, 0, 0, 0]
                 else:
                     y_min, x_min = non_zero_indices.min(axis=0).tolist()
                     y_max, x_max = non_zero_indices.max(axis=0).tolist()
-                    bbox = [x_min, y_min, x_max - x_min, y_max - y_min]  # x,y,w,h format
-                    if frame_idx < 5:
-                        print(f"[DEBUG]   Object {obj_id}: bbox={bbox}, mask_area={mask_area} pixels")
+                    bbox = [x_min, y_min, x_max - x_min, y_max - y_min]  # x,y,w,h
+                    last_bboxes[obj_id] = bbox
 
                 bbox_to_vis[obj_id] = bbox
                 mask_to_vis[obj_id] = mask
                 frame_results[int(obj_id)] = {
-                    "bbox": bbox,  # x, y, w, h
-                    "center": [bbox[0] + bbox[2] // 2, bbox[1] + bbox[3] // 2]  # center x, y
+                    "bbox": bbox,
+                    "center": [bbox[0] + bbox[2] // 2, bbox[1] + bbox[3] // 2]
                 }
 
-            all_results[frame_idx] = frame_results
+            chunk_results[global_frame_idx] = frame_results
 
             # Draw on frame if saving video
-            if args.save_to_video and loaded_frames is not None:
-                img = loaded_frames[frame_idx].copy()
+            if save_to_video and video_frames is not None and frame_idx < len(video_frames):
+                img = video_frames[frame_idx].copy()
 
                 # Draw masks
                 for obj_id, mask in mask_to_vis.items():
@@ -270,21 +237,143 @@ def main(args):
                     color = COLORS[obj_id % len(COLORS)]
                     x, y, w, h = bbox
                     cv2.rectangle(img, (x, y), (x + w, y + h), color, 2)
-                    # Draw ID label
                     label = f"ID:{obj_id}"
                     (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
                     cv2.rectangle(img, (x, y - label_h - 10), (x + label_w + 4, y), color, -1)
                     cv2.putText(img, label, (x + 2, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-                out.write(img)
+                video_frames[frame_idx] = img  # Update in place for writing later
 
-            # Progress indicator
-            if frame_idx % 100 == 0:
-                print(f"[DEBUG] Progress: Processed frame {frame_idx}...")
+        # Prepare prompts for next chunk using last detected bboxes (convert xywh to xyxy)
+        next_prompts = {}
+        for obj_id, (_, label) in prompts.items():
+            if obj_id in last_bboxes:
+                x, y, w, h = last_bboxes[obj_id]
+                bbox_xyxy = (x, y, x + w, y + h)
+                next_prompts[obj_id] = (bbox_xyxy, label)
+            else:
+                # Object lost - keep the original bbox
+                next_prompts[obj_id] = prompts[obj_id]
 
-        print(f"[DEBUG] Propagation complete: processed {frame_count} frames total")
+        # Clean up
+        del state
 
-    print(f"\n[DEBUG] Step 11: Saving outputs...")
+    return chunk_results, next_prompts, video_frames
+
+
+def main(args):
+    print("=" * 60)
+    print("[DEBUG] Starting multi-object tracking (chunked processing)")
+    print("=" * 60)
+    print(f"[DEBUG] Arguments:")
+    print(f"[DEBUG]   video_path: {args.video_path}")
+    print(f"[DEBUG]   txt_path: {args.txt_path}")
+    print(f"[DEBUG]   bbox_format: {args.bbox_format}")
+    print(f"[DEBUG]   model_path: {args.model_path}")
+    print(f"[DEBUG]   video_output_path: {args.video_output_path}")
+    print(f"[DEBUG]   result_path: {args.result_path}")
+    print(f"[DEBUG]   csv_path: {args.csv_path}")
+    print(f"[DEBUG]   save_to_video: {args.save_to_video}")
+    print(f"[DEBUG]   chunk_size: {args.chunk_size}")
+    print("-" * 60)
+
+    print("\n[DEBUG] Step 1: Loading model configuration...")
+    model_cfg = determine_model_cfg(args.model_path)
+
+    print("\n[DEBUG] Step 2: Building SAM2 video predictor...")
+    print(f"[DEBUG] Using device: cuda:0")
+    predictor = build_sam2_video_predictor(model_cfg, args.model_path, device="cuda:0")
+    print("[DEBUG] Predictor built successfully")
+
+    print("\n[DEBUG] Step 3: Getting video information...")
+    num_frames, width, height, frame_rate = get_video_info(args.video_path)
+    print(f"[DEBUG] Video: {num_frames} frames, {width}x{height}, {frame_rate} FPS")
+
+    print("\n[DEBUG] Step 4: Loading bounding boxes...")
+    prompts = load_txt_multi(args.txt_path, args.bbox_format)
+
+    num_objects = len(prompts)
+    print(f"\n[DEBUG] Step 5: Ready to track {num_objects} objects")
+
+    # Calculate chunks
+    chunk_size = args.chunk_size
+    num_chunks = (num_frames + chunk_size - 1) // chunk_size
+    print(f"[DEBUG] Processing video in {num_chunks} chunks of up to {chunk_size} frames each")
+    print("-" * 60)
+
+    # Results storage: frame_idx -> {obj_id: bbox}
+    all_results = {}
+
+    # Setup video writer
+    out = None
+    if args.save_to_video:
+        print(f"\n[DEBUG] Setting up video writer...")
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(args.video_output_path, fourcc, frame_rate, (width, height))
+        if out.isOpened():
+            print(f"[DEBUG] Video writer initialized: {args.video_output_path}")
+        else:
+            print(f"[DEBUG] WARNING: Video writer may not be properly initialized")
+
+    # Create temp directory for chunk frames
+    temp_base_dir = tempfile.mkdtemp(prefix="samurai_chunks_")
+    print(f"[DEBUG] Using temp directory: {temp_base_dir}")
+
+    current_prompts = prompts
+    try:
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * chunk_size
+            chunk_end = min((chunk_idx + 1) * chunk_size, num_frames)
+            chunk_frames_count = chunk_end - chunk_start
+
+            print(f"\n[DEBUG] Processing chunk {chunk_idx + 1}/{num_chunks}: frames {chunk_start}-{chunk_end - 1} ({chunk_frames_count} frames)")
+
+            # Extract chunk frames to temp directory
+            chunk_temp_dir = osp.join(temp_base_dir, f"chunk_{chunk_idx:04d}")
+            print(f"[DEBUG] Extracting frames to: {chunk_temp_dir}")
+            extract_chunk_frames(args.video_path, chunk_start, chunk_end, chunk_temp_dir)
+
+            # Load frames for visualization if needed
+            video_frames = None
+            if args.save_to_video:
+                video_frames = load_chunk_frames_for_vis(args.video_path, chunk_start, chunk_end)
+                print(f"[DEBUG] Loaded {len(video_frames)} frames for visualization")
+
+            # Process chunk
+            print(f"[DEBUG] Running tracking on chunk...")
+            chunk_results, next_prompts, video_frames = process_chunk(
+                predictor, chunk_temp_dir, current_prompts, chunk_start,
+                args.save_to_video, video_frames, height, width
+            )
+
+            # Merge results
+            all_results.update(chunk_results)
+
+            # Write frames to video
+            if args.save_to_video and video_frames is not None:
+                for frame in video_frames:
+                    out.write(frame)
+                print(f"[DEBUG] Wrote {len(video_frames)} frames to output video")
+
+            # Update prompts for next chunk
+            current_prompts = next_prompts
+
+            # Clean up chunk temp directory
+            shutil.rmtree(chunk_temp_dir)
+
+            # Clean up GPU memory between chunks
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            print(f"[DEBUG] Chunk {chunk_idx + 1} complete. Total frames processed: {len(all_results)}")
+
+    finally:
+        # Clean up temp directory
+        if osp.exists(temp_base_dir):
+            shutil.rmtree(temp_base_dir)
+            print(f"[DEBUG] Cleaned up temp directory")
+
+    print(f"\n[DEBUG] Saving outputs...")
     if out is not None:
         out.release()
         print(f"[DEBUG] Video writer released")
@@ -293,15 +382,19 @@ def main(args):
     # Save results to JSON
     if args.result_path:
         print(f"[DEBUG] Saving results to JSON: {args.result_path}")
+        # Convert keys to strings for JSON serialization
+        json_results = {str(k): v for k, v in all_results.items()}
         output_data = {
             "video_path": args.video_path,
             "num_objects": num_objects,
             "num_frames": len(all_results),
+            "chunk_size": chunk_size,
+            "num_chunks": num_chunks,
             "format": {
                 "bbox": "x, y, width, height (top-left corner)",
                 "center": "center_x, center_y"
             },
-            "frames": all_results
+            "frames": json_results
         }
         with open(args.result_path, 'w') as f:
             json.dump(output_data, f, indent=2)
@@ -321,12 +414,9 @@ def main(args):
                     total_rows += 1
         print(f"[DEBUG] CSV saved successfully ({total_rows} data rows)")
 
-    print(f"\n[DEBUG] Step 12: Cleaning up resources...")
-    print(f"[DEBUG] Deleting predictor and state...")
-    del predictor, state
-    print(f"[DEBUG] Running garbage collection...")
+    print(f"\n[DEBUG] Cleaning up resources...")
+    del predictor
     gc.collect()
-    print(f"[DEBUG] Clearing CUDA cache...")
     torch.clear_autocast_cache()
     torch.cuda.empty_cache()
 
@@ -335,6 +425,7 @@ def main(args):
     print(f"[DEBUG] Summary:")
     print(f"[DEBUG]   Objects tracked: {num_objects}")
     print(f"[DEBUG]   Frames processed: {len(all_results)}")
+    print(f"[DEBUG]   Chunks processed: {num_chunks}")
     if args.save_to_video:
         print(f"[DEBUG]   Output video: {args.video_output_path}")
     if args.result_path:
@@ -345,7 +436,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Multi-person tracking with SAMURAI")
+    parser = argparse.ArgumentParser(description="Multi-person tracking with SAMURAI (chunked processing for long videos)")
     parser.add_argument("--video_path", required=True, help="Input video path or directory of frames.")
     parser.add_argument("--txt_path", required=True, help="Path to bounding box file (one bbox per line).")
     parser.add_argument("--bbox_format", default="xywh", choices=["xywh", "xyxy"],
@@ -355,5 +446,8 @@ if __name__ == "__main__":
     parser.add_argument("--result_path", default=None, help="Path to save tracking results as JSON.")
     parser.add_argument("--csv_path", default=None, help="Path to save tracking results as CSV.")
     parser.add_argument("--save_to_video", type=lambda x: x.lower() == 'true', default=True, help="Save results to a video.")
+    parser.add_argument("--chunk_size", type=int, default=DEFAULT_CHUNK_SIZE,
+                        help=f"Number of frames per chunk for memory-efficient processing (default: {DEFAULT_CHUNK_SIZE}). "
+                             "Lower values use less memory but may affect tracking continuity at chunk boundaries.")
     args = parser.parse_args()
     main(args)
