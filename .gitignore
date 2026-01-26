@@ -166,4 +166,4 @@ visualization/*
 demo/
 
 # checkpoints
-sam2
+sam2/checkpoints

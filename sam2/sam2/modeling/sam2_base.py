@@ -198,11 +198,11 @@ class SAM2Base(torch.nn.Module):
         # Whether to use SAMURAI or original SAM 2
         self.samurai_mode = samurai_mode
 
-        # Init Kalman Filter
+        # Init Kalman Filter (per-object states for multi-object tracking)
         self.kf = KalmanFilter()
-        self.kf_mean = None
-        self.kf_covariance = None
-        self.stable_frames = 0
+        self.kf_means = {}  # dict: obj_idx -> kf_mean
+        self.kf_covariances = {}  # dict: obj_idx -> kf_covariance
+        self.stable_frames_per_obj = {}  # dict: obj_idx -> stable_frames count
 
         # Debug purpose
         self.history = {} # debug
@@ -235,6 +235,14 @@ class SAM2Base(torch.nn.Module):
     @property
     def device(self):
         return next(self.parameters()).device
+
+    def reset_tracking_state(self):
+        """Reset per-object Kalman filter states for a new video."""
+        self.kf_means.clear()
+        self.kf_covariances.clear()
+        self.stable_frames_per_obj.clear()
+        self.frame_cnt = 0
+        self.history.clear()
 
     def forward(self, *args, **kwargs):
         raise NotImplementedError(
@@ -418,84 +426,103 @@ class SAM2Base(torch.nn.Module):
         sam_output_token = sam_output_tokens[:, 0]
         kf_ious = None
         if multimask_output and self.samurai_mode:
-            if self.kf_mean is None and self.kf_covariance is None or self.stable_frames == 0:
-                best_iou_inds = torch.argmax(ious, dim=-1)
-                batch_inds = torch.arange(B, device=device)
-                low_res_masks = low_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
-                high_res_masks = high_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
-                non_zero_indices = torch.argwhere(high_res_masks[0][0] > 0.0)
-                if len(non_zero_indices) == 0:
-                    high_res_bbox = [0, 0, 0, 0]
-                else:
-                    y_min, x_min = non_zero_indices.min(dim=0).values
-                    y_max, x_max = non_zero_indices.max(dim=0).values
-                    high_res_bbox = [x_min.item(), y_min.item(), x_max.item(), y_max.item()]
-                self.kf_mean, self.kf_covariance = self.kf.initiate(self.kf.xyxy_to_xyah(high_res_bbox))
-                if sam_output_tokens.size(1) > 1:
-                    sam_output_token = sam_output_tokens[batch_inds, best_iou_inds]
-                self.frame_cnt += 1
-                self.stable_frames += 1
-            elif self.stable_frames < self.stable_frames_threshold:
-                self.kf_mean, self.kf_covariance = self.kf.predict(self.kf_mean, self.kf_covariance)
-                best_iou_inds = torch.argmax(ious, dim=-1)
-                batch_inds = torch.arange(B, device=device)
-                low_res_masks = low_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
-                high_res_masks = high_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
-                non_zero_indices = torch.argwhere(high_res_masks[0][0] > 0.0)
-                if len(non_zero_indices) == 0:
-                    high_res_bbox = [0, 0, 0, 0]
-                else:
-                    y_min, x_min = non_zero_indices.min(dim=0).values
-                    y_max, x_max = non_zero_indices.max(dim=0).values
-                    high_res_bbox = [x_min.item(), y_min.item(), x_max.item(), y_max.item()]
-                if ious[0][best_iou_inds] > self.stable_ious_threshold:
-                    self.kf_mean, self.kf_covariance = self.kf.update(self.kf_mean, self.kf_covariance, self.kf.xyxy_to_xyah(high_res_bbox))
-                    self.stable_frames += 1
-                else:
-                    self.stable_frames = 0
-                if sam_output_tokens.size(1) > 1:
-                    sam_output_token = sam_output_tokens[batch_inds, best_iou_inds]
-                self.frame_cnt += 1
-            else:
-                self.kf_mean, self.kf_covariance = self.kf.predict(self.kf_mean, self.kf_covariance)
-                high_res_multibboxes = []
-                batch_inds = torch.arange(B, device=device)
-                for i in range(ious.shape[1]):
-                    non_zero_indices = torch.argwhere(high_res_multimasks[batch_inds, i].unsqueeze(1)[0][0] > 0.0)
+            # Process each object in the batch independently with its own Kalman filter state
+            best_iou_inds_list = []
+            batch_inds = torch.arange(B, device=device)
+
+            for obj_idx in range(B):
+                obj_ious = ious[obj_idx]  # shape: (num_multimasks,)
+                obj_high_res_multimasks = high_res_multimasks[obj_idx]  # shape: (num_multimasks, H, W)
+
+                # Get or initialize per-object state
+                kf_mean = self.kf_means.get(obj_idx)
+                kf_cov = self.kf_covariances.get(obj_idx)
+                stable_frames = self.stable_frames_per_obj.get(obj_idx, 0)
+
+                if kf_mean is None or kf_cov is None or stable_frames == 0:
+                    # Initial frame for this object - use best IoU
+                    best_iou_idx = torch.argmax(obj_ious).item()
+                    best_iou_inds_list.append(best_iou_idx)
+
+                    # Extract bbox from selected mask
+                    selected_mask = obj_high_res_multimasks[best_iou_idx]
+                    non_zero_indices = torch.argwhere(selected_mask > 0.0)
                     if len(non_zero_indices) == 0:
-                        high_res_multibboxes.append([0, 0, 0, 0])
+                        high_res_bbox = [0, 0, 0, 0]
                     else:
                         y_min, x_min = non_zero_indices.min(dim=0).values
                         y_max, x_max = non_zero_indices.max(dim=0).values
-                        high_res_multibboxes.append([x_min.item(), y_min.item(), x_max.item(), y_max.item()])
-                # compute the IoU between the predicted bbox and the high_res_multibboxes
-                kf_ious = torch.tensor(self.kf.compute_iou(self.kf_mean[:4], high_res_multibboxes), device=device)
-                # weighted iou
-                weighted_ious = self.kf_score_weight * kf_ious + (1 - self.kf_score_weight) * ious
-                best_iou_inds = torch.argmax(weighted_ious, dim=-1)
-                batch_inds = torch.arange(B, device=device)
-                low_res_masks = low_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
-                high_res_masks = high_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
-                if sam_output_tokens.size(1) > 1:
-                    sam_output_token = sam_output_tokens[batch_inds, best_iou_inds]
+                        high_res_bbox = [x_min.item(), y_min.item(), x_max.item(), y_max.item()]
 
-                if False:
-                    # make all these on cpu                        
-                    self.history[self.frame_cnt] = {
-                        "kf_predicted_bbox": self.kf.xyah_to_xyxy(self.kf_mean[:4]),
-                        # "multi_masks": high_res_multimasks.cpu(),
-                        "ious": ious.cpu(),
-                        "multi_bboxes": high_res_multibboxes,
-                        "kf_ious": kf_ious,
-                        "weighted_ious": weighted_ious.cpu(),
-                        "final_selection": best_iou_inds.cpu(),
-                    }
-                self.frame_cnt += 1
+                    # Initialize Kalman filter for this object
+                    kf_mean, kf_cov = self.kf.initiate(self.kf.xyxy_to_xyah(high_res_bbox))
+                    self.kf_means[obj_idx] = kf_mean
+                    self.kf_covariances[obj_idx] = kf_cov
+                    self.stable_frames_per_obj[obj_idx] = 1
 
-                if ious[0][best_iou_inds] < self.stable_ious_threshold:
-                    self.stable_frames = 0
+                elif stable_frames < self.stable_frames_threshold:
+                    # Stabilization phase - use IoU only, update KF
+                    kf_mean, kf_cov = self.kf.predict(kf_mean, kf_cov)
+                    best_iou_idx = torch.argmax(obj_ious).item()
+                    best_iou_inds_list.append(best_iou_idx)
+
+                    # Extract bbox from selected mask
+                    selected_mask = obj_high_res_multimasks[best_iou_idx]
+                    non_zero_indices = torch.argwhere(selected_mask > 0.0)
+                    if len(non_zero_indices) == 0:
+                        high_res_bbox = [0, 0, 0, 0]
+                    else:
+                        y_min, x_min = non_zero_indices.min(dim=0).values
+                        y_max, x_max = non_zero_indices.max(dim=0).values
+                        high_res_bbox = [x_min.item(), y_min.item(), x_max.item(), y_max.item()]
+
+                    # Update KF if IoU is good
+                    if obj_ious[best_iou_idx].item() > self.stable_ious_threshold:
+                        kf_mean, kf_cov = self.kf.update(kf_mean, kf_cov, self.kf.xyxy_to_xyah(high_res_bbox))
+                        self.stable_frames_per_obj[obj_idx] = stable_frames + 1
+                    else:
+                        self.stable_frames_per_obj[obj_idx] = 0
+
+                    self.kf_means[obj_idx] = kf_mean
+                    self.kf_covariances[obj_idx] = kf_cov
+
                 else:
-                    self.kf_mean, self.kf_covariance = self.kf.update(self.kf_mean, self.kf_covariance, self.kf.xyxy_to_xyah(high_res_multibboxes[best_iou_inds]))
+                    # Stable tracking - use weighted IoU with KF prediction
+                    kf_mean, kf_cov = self.kf.predict(kf_mean, kf_cov)
+
+                    # Compute bboxes for all multimasks of this object
+                    high_res_multibboxes = []
+                    for i in range(obj_high_res_multimasks.shape[0]):
+                        non_zero_indices = torch.argwhere(obj_high_res_multimasks[i] > 0.0)
+                        if len(non_zero_indices) == 0:
+                            high_res_multibboxes.append([0, 0, 0, 0])
+                        else:
+                            y_min, x_min = non_zero_indices.min(dim=0).values
+                            y_max, x_max = non_zero_indices.max(dim=0).values
+                            high_res_multibboxes.append([x_min.item(), y_min.item(), x_max.item(), y_max.item()])
+
+                    # Compute weighted IoU
+                    obj_kf_ious = torch.tensor(self.kf.compute_iou(kf_mean[:4], high_res_multibboxes), device=device)
+                    weighted_ious = self.kf_score_weight * obj_kf_ious + (1 - self.kf_score_weight) * obj_ious
+                    best_iou_idx = torch.argmax(weighted_ious).item()
+                    best_iou_inds_list.append(best_iou_idx)
+
+                    # Update KF state
+                    if obj_ious[best_iou_idx].item() < self.stable_ious_threshold:
+                        self.stable_frames_per_obj[obj_idx] = 0
+                    else:
+                        kf_mean, kf_cov = self.kf.update(kf_mean, kf_cov, self.kf.xyxy_to_xyah(high_res_multibboxes[best_iou_idx]))
+
+                    self.kf_means[obj_idx] = kf_mean
+                    self.kf_covariances[obj_idx] = kf_cov
+
+            # Convert list to tensor for batch indexing
+            best_iou_inds = torch.tensor(best_iou_inds_list, device=device)
+            low_res_masks = low_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
+            high_res_masks = high_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
+            if sam_output_tokens.size(1) > 1:
+                sam_output_token = sam_output_tokens[batch_inds, best_iou_inds]
+            self.frame_cnt += 1
         elif multimask_output and not self.samurai_mode:
             # take the best mask prediction (with the highest IoU estimation)
             best_iou_inds = torch.argmax(ious, dim=-1)
@@ -661,19 +688,23 @@ class SAM2Base(torch.nn.Module):
             stride = 1 if self.training else self.memory_temporal_stride_for_eval
 
             if self.samurai_mode:
-                valid_indices = [] 
+                valid_indices = []
                 if frame_idx > 1:  # Ensure we have previous frames to evaluate
                     for i in range(frame_idx - 1, 1, -1):  # Iterate backwards through previous frames
                         iou_score = output_dict["non_cond_frame_outputs"][i]["best_iou_score"]  # Get mask affinity score
                         obj_score = output_dict["non_cond_frame_outputs"][i]["object_score_logits"]  # Get object score
                         kf_score = output_dict["non_cond_frame_outputs"][i]["kf_score"] if "kf_score" in output_dict["non_cond_frame_outputs"][i] else None  # Get motion score if available
+                        # For multi-object tracking, use mean score across all objects
+                        iou_val = iou_score.mean().item() if iou_score.numel() > 1 else iou_score.item()
+                        obj_val = obj_score.mean().item() if obj_score.numel() > 1 else obj_score.item()
+                        kf_val = kf_score.mean().item() if kf_score is not None and kf_score.numel() > 1 else (kf_score.item() if kf_score is not None else None)
                         # Check if the scores meet the criteria for being a valid index
-                        if iou_score.item() > self.memory_bank_iou_threshold and \
-                           obj_score.item() > self.memory_bank_obj_score_threshold and \
-                           (kf_score is None or kf_score.item() > self.memory_bank_kf_score_threshold):
-                            valid_indices.insert(0, i)  
+                        if iou_val > self.memory_bank_iou_threshold and \
+                           obj_val > self.memory_bank_obj_score_threshold and \
+                           (kf_val is None or kf_val > self.memory_bank_kf_score_threshold):
+                            valid_indices.insert(0, i)
                         # Check the number of valid indices
-                        if len(valid_indices) >= self.max_obj_ptrs_in_encoder - 1:  
+                        if len(valid_indices) >= self.max_obj_ptrs_in_encoder - 1:
                             break
                 if frame_idx - 1 not in valid_indices: 
                     valid_indices.append(frame_idx - 1)

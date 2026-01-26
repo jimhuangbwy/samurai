@@ -49,6 +49,8 @@ class SAM2VideoPredictor(SAM2Base):
         async_loading_frames=False,
     ):
         """Initialize an inference state."""
+        # Reset per-object tracking state for new video
+        self.reset_tracking_state()
         compute_device = self.device  # device of the model
         images, video_height, video_width = load_video_frames(
             video_path=video_path,
