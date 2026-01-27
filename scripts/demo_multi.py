@@ -280,7 +280,6 @@ def main(args):
     print(f"[DEBUG]   video_output_path: {args.video_output_path}")
     print(f"[DEBUG]   frame_output_path: {args.frame_output_path}")
     print(f"[DEBUG]   result_path: {args.result_path}")
-    print(f"[DEBUG]   csv_path: {args.csv_path}")
     print(f"[DEBUG]   save_to_video: {args.save_to_video}")
     print(f"[DEBUG]   chunk_size: {args.chunk_size}")
     print(f"[DEBUG]   start_frame: {args.start_frame}")
@@ -433,20 +432,6 @@ def main(args):
             json.dump(output_data, f, indent=2)
         print(f"[DEBUG] JSON results saved successfully ({len(all_results)} frames)")
 
-    # Also save to simple CSV format for easy parsing
-    if args.csv_path:
-        print(f"[DEBUG] Saving results to CSV: {args.csv_path}")
-        total_rows = 0
-        with open(args.csv_path, 'w') as f:
-            f.write("frame,object_id,x,y,width,height,center_x,center_y\n")
-            for frame_idx in sorted(all_results.keys()):
-                for obj_id, data in all_results[frame_idx].items():
-                    bbox = data["bbox"]
-                    center = data["center"]
-                    f.write(f"{frame_idx},{obj_id},{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]},{center[0]},{center[1]}\n")
-                    total_rows += 1
-        print(f"[DEBUG] CSV saved successfully ({total_rows} data rows)")
-
     print(f"\n[DEBUG] Cleaning up resources...")
     del predictor
     gc.collect()
@@ -465,8 +450,6 @@ def main(args):
         print(f"[DEBUG]   Frame images: {args.frame_output_path}/")
     if args.result_path:
         print(f"[DEBUG]   JSON results: {args.result_path}")
-    if args.csv_path:
-        print(f"[DEBUG]   CSV results: {args.csv_path}")
     print("=" * 60)
 
 
@@ -480,7 +463,6 @@ if __name__ == "__main__":
     parser.add_argument("--video_output_path", default="demo_multi.mp4", help="Path to save the output video.")
     parser.add_argument("--frame_output_path", default=None, help="Path to folder for saving output frame images. Defaults to 'frame_images' in same directory as video output.")
     parser.add_argument("--result_path", default=None, help="Path to save tracking results as JSON.")
-    parser.add_argument("--csv_path", default=None, help="Path to save tracking results as CSV.")
     parser.add_argument("--save_to_video", type=lambda x: x.lower() == 'true', default=True, help="Save results to a video.")
     parser.add_argument("--chunk_size", type=int, default=DEFAULT_CHUNK_SIZE,
                         help=f"Number of frames per chunk for memory-efficient processing (default: {DEFAULT_CHUNK_SIZE}). "
