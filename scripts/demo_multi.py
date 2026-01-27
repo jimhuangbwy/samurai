@@ -262,6 +262,13 @@ def process_chunk(predictor, chunk_path, prompts, chunk_start_frame, save_to_vid
 
 
 def main(args):
+    # Compute frame_output_path if not specified (same directory as video output)
+    if args.frame_output_path is None:
+        video_output_dir = osp.dirname(args.video_output_path)
+        if video_output_dir == "":
+            video_output_dir = "."
+        args.frame_output_path = osp.join(video_output_dir, "frame_images")
+
     print("=" * 60)
     print("[DEBUG] Starting multi-object tracking (chunked processing)")
     print("=" * 60)
@@ -271,6 +278,7 @@ def main(args):
     print(f"[DEBUG]   bbox_format: {args.bbox_format}")
     print(f"[DEBUG]   model_path: {args.model_path}")
     print(f"[DEBUG]   video_output_path: {args.video_output_path}")
+    print(f"[DEBUG]   frame_output_path: {args.frame_output_path}")
     print(f"[DEBUG]   result_path: {args.result_path}")
     print(f"[DEBUG]   csv_path: {args.csv_path}")
     print(f"[DEBUG]   save_to_video: {args.save_to_video}")
@@ -315,6 +323,10 @@ def main(args):
         else:
             print(f"[DEBUG] WARNING: Video writer may not be properly initialized")
 
+        # Create frame output directory
+        os.makedirs(args.frame_output_path, exist_ok=True)
+        print(f"[DEBUG] Frame output directory: {args.frame_output_path}")
+
     # Create temp directory for chunk frames
     temp_base_dir = tempfile.mkdtemp(prefix="samurai_chunks_")
     print(f"[DEBUG] Using temp directory: {temp_base_dir}")
@@ -349,11 +361,15 @@ def main(args):
             # Merge results
             all_results.update(chunk_results)
 
-            # Write frames to video
+            # Write frames to video and save as images
             if args.save_to_video and video_frames is not None:
-                for frame in video_frames:
+                for i, frame in enumerate(video_frames):
                     out.write(frame)
-                print(f"[DEBUG] Wrote {len(video_frames)} frames to output video")
+                    # Save frame as image
+                    global_frame_idx = chunk_start + i
+                    frame_filename = osp.join(args.frame_output_path, f"frame_image_{global_frame_idx:06d}.jpg")
+                    cv2.imwrite(frame_filename, frame)
+                print(f"[DEBUG] Wrote {len(video_frames)} frames to output video and frame_images folder")
 
             # Update prompts for next chunk
             current_prompts = next_prompts
@@ -428,6 +444,7 @@ def main(args):
     print(f"[DEBUG]   Chunks processed: {num_chunks}")
     if args.save_to_video:
         print(f"[DEBUG]   Output video: {args.video_output_path}")
+        print(f"[DEBUG]   Frame images: {args.frame_output_path}/")
     if args.result_path:
         print(f"[DEBUG]   JSON results: {args.result_path}")
     if args.csv_path:
@@ -443,6 +460,7 @@ if __name__ == "__main__":
                         help="Bounding box format: 'xywh' for x,y,width,height or 'xyxy' for x1,y1,x2,y2 (default: xywh)")
     parser.add_argument("--model_path", default="sam2/checkpoints/sam2.1_hiera_base_plus.pt", help="Path to the model checkpoint.")
     parser.add_argument("--video_output_path", default="demo_multi.mp4", help="Path to save the output video.")
+    parser.add_argument("--frame_output_path", default=None, help="Path to folder for saving output frame images. Defaults to 'frame_images' in same directory as video output.")
     parser.add_argument("--result_path", default=None, help="Path to save tracking results as JSON.")
     parser.add_argument("--csv_path", default=None, help="Path to save tracking results as CSV.")
     parser.add_argument("--save_to_video", type=lambda x: x.lower() == 'true', default=True, help="Save results to a video.")
