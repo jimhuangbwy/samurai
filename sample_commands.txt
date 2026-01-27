@@ -5,3 +5,21 @@ python scripts/demo_multi.py \
       --video_output_path ./demo/cortis_go/demo_multi.mp4 \
       --result_path ./demo/cortis_go/cortis_go_result.json \
       --cache_path ./demo/cortis_go/cortis_go_cache.json
+
+
+python scripts/demo_multi.py \
+      --video_path ./demo/cortis_go/cortis_go_cut.mp4 \
+      --txt_path ./demo/cortis_go/bbox_multi_2967.txt \
+      --video_output_path ./demo/cortis_go/demo_multi_2967.mp4 \
+      --result_path ./demo/cortis_go/cortis_go_result_2967.json \
+      --cache_path ./demo/cortis_go/cortis_go_cache.json \
+      --start_frame 2967 --end_frame 3000
+
+
+python scripts/demo_multi.py \
+      --video_path ./demo/cortis_go/cortis_go_cut.mp4 \
+      --txt_path ./demo/cortis_go/bbox_multi_2981.txt \
+      --video_output_path ./demo/cortis_go/demo_multi_2981.mp4 \
+      --result_path ./demo/cortis_go/cortis_go_result_2981.json \
+      --cache_path ./demo/cortis_go/cortis_go_cache.json \
+      --start_frame 2981 --end_frame 3020      
