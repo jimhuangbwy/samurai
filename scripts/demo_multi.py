@@ -175,10 +175,77 @@ def load_chunk_frames_for_vis(video_path, start_frame, end_frame):
     return frames
 
 
-def process_chunk(predictor, chunk_path, prompts, chunk_start_frame, save_to_video,
-                  video_frames=None, height=None, width=None):
-    """Process a single chunk of video and return results and updated prompts for next chunk."""
+def process_chunk_from_cache(prompts, chunk_start_frame, chunk_end_frame, save_to_video,
+                             video_frames, height, width, cached_results):
+    """Process a chunk entirely from cache (no prediction needed).
+
+    Returns:
+        chunk_results: Dict of frame_idx -> {obj_id: {"bbox": [...], "center": [...]}}
+        next_prompts: Updated prompts for next chunk
+        video_frames: Frames with visualization drawn
+    """
     chunk_results = {}
+    last_bboxes = {}
+
+    for frame_idx in range(chunk_end_frame - chunk_start_frame):
+        global_frame_idx = chunk_start_frame + frame_idx
+        cached_frame_data = cached_results[global_frame_idx]
+        chunk_results[global_frame_idx] = cached_frame_data
+
+        # Update last_bboxes for tracking continuity
+        for obj_id_str, data in cached_frame_data.items():
+            obj_id = int(obj_id_str) if isinstance(obj_id_str, str) else obj_id_str
+            last_bboxes[obj_id] = data["bbox"]
+
+        # Draw cached data on frame if saving video (bbox only, no mask)
+        if save_to_video and video_frames is not None and frame_idx < len(video_frames):
+            img = video_frames[frame_idx].copy()
+            for obj_id_str, data in cached_frame_data.items():
+                obj_id = int(obj_id_str) if isinstance(obj_id_str, str) else obj_id_str
+                color = COLORS[obj_id % len(COLORS)]
+                bbox = data["bbox"]
+                x, y, w, h = bbox
+                cv2.rectangle(img, (x, y), (x + w, y + h), color, 2)
+                label = f"ID:{obj_id}"
+                (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                cv2.rectangle(img, (x, y - label_h - 10), (x + label_w + 4, y), color, -1)
+                cv2.putText(img, label, (x + 2, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            video_frames[frame_idx] = img
+
+    # Prepare prompts for next chunk using last cached bboxes (convert xywh to xyxy)
+    next_prompts = {}
+    for obj_id, (_, label) in prompts.items():
+        if obj_id in last_bboxes:
+            x, y, w, h = last_bboxes[obj_id]
+            bbox_xyxy = (x, y, x + w, y + h)
+            next_prompts[obj_id] = (bbox_xyxy, label)
+        else:
+            # Object not in cache - keep the original bbox
+            next_prompts[obj_id] = prompts[obj_id]
+
+    return chunk_results, next_prompts, video_frames
+
+
+def is_chunk_fully_cached(chunk_start, chunk_end, cached_results):
+    """Check if all frames in a chunk are available in cache."""
+    if cached_results is None:
+        return False
+    for frame_idx in range(chunk_start, chunk_end):
+        if frame_idx not in cached_results:
+            return False
+    return True
+
+
+def process_chunk(predictor, chunk_path, prompts, chunk_start_frame, save_to_video,
+                  video_frames=None, height=None, width=None, cached_results=None):
+    """Process a single chunk of video and return results and updated prompts for next chunk.
+
+    Args:
+        cached_results: Dict of frame_idx -> {obj_id: {"bbox": [...], "center": [...]}} for pre-calculated frames.
+                       If a frame exists in cache, skip prediction and use cached data.
+    """
+    chunk_results = {}
+    cached_frames_used = 0
 
     with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
         state = predictor.init_state(chunk_path, offload_video_to_cpu=True)
@@ -191,6 +258,36 @@ def process_chunk(predictor, chunk_path, prompts, chunk_start_frame, save_to_vid
         last_bboxes = {}  # Store last valid bbox for each object
         for frame_idx, object_ids, masks in predictor.propagate_in_video(state):
             global_frame_idx = chunk_start_frame + frame_idx
+
+            # Check if this frame is in cache
+            if cached_results is not None and global_frame_idx in cached_results:
+                # Use cached data
+                cached_frame_data = cached_results[global_frame_idx]
+                chunk_results[global_frame_idx] = cached_frame_data
+                cached_frames_used += 1
+
+                # Update last_bboxes from cache for tracking continuity
+                for obj_id_str, data in cached_frame_data.items():
+                    obj_id = int(obj_id_str) if isinstance(obj_id_str, str) else obj_id_str
+                    last_bboxes[obj_id] = data["bbox"]
+
+                # Draw cached data on frame if saving video (bbox only, no mask)
+                if save_to_video and video_frames is not None and frame_idx < len(video_frames):
+                    img = video_frames[frame_idx].copy()
+                    for obj_id_str, data in cached_frame_data.items():
+                        obj_id = int(obj_id_str) if isinstance(obj_id_str, str) else obj_id_str
+                        color = COLORS[obj_id % len(COLORS)]
+                        bbox = data["bbox"]
+                        x, y, w, h = bbox
+                        cv2.rectangle(img, (x, y), (x + w, y + h), color, 2)
+                        label = f"ID:{obj_id}"
+                        (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                        cv2.rectangle(img, (x, y - label_h - 10), (x + label_w + 4, y), color, -1)
+                        cv2.putText(img, label, (x + 2, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                    video_frames[frame_idx] = img
+                continue
+
+            # Process frame with prediction
             mask_to_vis = {}
             bbox_to_vis = {}
             frame_results = {}
@@ -258,6 +355,9 @@ def process_chunk(predictor, chunk_path, prompts, chunk_start_frame, save_to_vid
         # Clean up
         del state
 
+    if cached_frames_used > 0:
+        print(f"[DEBUG] Used {cached_frames_used} cached frames in this chunk")
+
     return chunk_results, next_prompts, video_frames
 
 
@@ -275,15 +375,14 @@ def main(args):
     print(f"[DEBUG] Arguments:")
     print(f"[DEBUG]   video_path: {args.video_path}")
     print(f"[DEBUG]   txt_path: {args.txt_path}")
-    print(f"[DEBUG]   bbox_format: {args.bbox_format}")
+    print(f"[DEBUG]   txt_bbox_format: {args.txt_bbox_format}")
     print(f"[DEBUG]   model_path: {args.model_path}")
     print(f"[DEBUG]   video_output_path: {args.video_output_path}")
     print(f"[DEBUG]   frame_output_path: {args.frame_output_path}")
     print(f"[DEBUG]   result_path: {args.result_path}")
+    print(f"[DEBUG]   cache_path: {args.cache_path}")
     print(f"[DEBUG]   save_to_video: {args.save_to_video}")
     print(f"[DEBUG]   chunk_size: {args.chunk_size}")
-    print(f"[DEBUG]   start_frame: {args.start_frame}")
-    print(f"[DEBUG]   end_frame: {args.end_frame}")
     print("-" * 60)
 
     print("\n[DEBUG] Step 1: Loading model configuration...")
@@ -299,29 +398,34 @@ def main(args):
     print(f"[DEBUG] Video: {num_frames} frames, {width}x{height}, {frame_rate} FPS")
 
     print("\n[DEBUG] Step 4: Loading bounding boxes...")
-    prompts = load_txt_multi(args.txt_path, args.bbox_format)
+    prompts = load_txt_multi(args.txt_path, args.txt_bbox_format)
+
+    # Load cache if specified
+    cached_results = None
+    if args.cache_path and osp.exists(args.cache_path):
+        print(f"\n[DEBUG] Step 4.5: Loading cache from {args.cache_path}...")
+        with open(args.cache_path, 'r') as f:
+            cache_data = json.load(f)
+        # Convert string keys to int for frame indices
+        if "frames" in cache_data:
+            cached_results = {int(k): v for k, v in cache_data["frames"].items()}
+            print(f"[DEBUG] Loaded {len(cached_results)} cached frames")
+        else:
+            print(f"[DEBUG] WARNING: Cache file has no 'frames' key, ignoring cache")
+    elif args.cache_path:
+        print(f"[DEBUG] WARNING: Cache file not found: {args.cache_path}")
 
     num_objects = len(prompts)
     print(f"\n[DEBUG] Step 5: Ready to track {num_objects} objects")
 
-    # Determine frame range to process
-    start_frame = args.start_frame
-    end_frame = args.end_frame if args.end_frame is not None else num_frames
-
-    # Validate frame range
-    if start_frame < 0:
-        start_frame = 0
-    if end_frame > num_frames:
-        end_frame = num_frames
-    if start_frame >= end_frame:
-        raise ValueError(f"Invalid frame range: start_frame ({start_frame}) must be less than end_frame ({end_frame})")
-
-    frames_to_process = end_frame - start_frame
-    print(f"[DEBUG] Frame range: {start_frame} to {end_frame - 1} ({frames_to_process} frames)")
+    # Frame range to process (all frames)
+    start_frame = 0
+    end_frame = num_frames
+    print(f"[DEBUG] Processing all {num_frames} frames")
 
     # Calculate chunks
     chunk_size = args.chunk_size
-    num_chunks = (frames_to_process + chunk_size - 1) // chunk_size
+    num_chunks = (num_frames + chunk_size - 1) // chunk_size
     print(f"[DEBUG] Processing in {num_chunks} chunks of up to {chunk_size} frames each")
     print("-" * 60)
 
@@ -348,6 +452,7 @@ def main(args):
     print(f"[DEBUG] Using temp directory: {temp_base_dir}")
 
     current_prompts = prompts
+    chunks_skipped = 0  # Count chunks processed entirely from cache
     try:
         for chunk_idx in range(num_chunks):
             chunk_start = start_frame + chunk_idx * chunk_size
@@ -356,23 +461,45 @@ def main(args):
 
             print(f"\n[DEBUG] Processing chunk {chunk_idx + 1}/{num_chunks}: frames {chunk_start}-{chunk_end - 1} ({chunk_frames_count} frames)")
 
-            # Extract chunk frames to temp directory
-            chunk_temp_dir = osp.join(temp_base_dir, f"chunk_{chunk_idx:04d}")
-            print(f"[DEBUG] Extracting frames to: {chunk_temp_dir}")
-            extract_chunk_frames(args.video_path, chunk_start, chunk_end, chunk_temp_dir)
+            # Check if chunk is fully cached
+            chunk_fully_cached = is_chunk_fully_cached(chunk_start, chunk_end, cached_results)
 
-            # Load frames for visualization if needed
-            video_frames = None
-            if args.save_to_video:
-                video_frames = load_chunk_frames_for_vis(args.video_path, chunk_start, chunk_end)
-                print(f"[DEBUG] Loaded {len(video_frames)} frames for visualization")
+            if chunk_fully_cached:
+                # Process chunk entirely from cache (skip prediction)
+                print(f"[DEBUG] Chunk fully cached, skipping prediction...")
+                chunks_skipped += 1
 
-            # Process chunk
-            print(f"[DEBUG] Running tracking on chunk...")
-            chunk_results, next_prompts, video_frames = process_chunk(
-                predictor, chunk_temp_dir, current_prompts, chunk_start,
-                args.save_to_video, video_frames, height, width
-            )
+                # Load frames for visualization if needed
+                video_frames = None
+                if args.save_to_video:
+                    video_frames = load_chunk_frames_for_vis(args.video_path, chunk_start, chunk_end)
+                    print(f"[DEBUG] Loaded {len(video_frames)} frames for visualization")
+
+                chunk_results, next_prompts, video_frames = process_chunk_from_cache(
+                    current_prompts, chunk_start, chunk_end, args.save_to_video,
+                    video_frames, height, width, cached_results
+                )
+            else:
+                # Extract chunk frames to temp directory for prediction
+                chunk_temp_dir = osp.join(temp_base_dir, f"chunk_{chunk_idx:04d}")
+                print(f"[DEBUG] Extracting frames to: {chunk_temp_dir}")
+                extract_chunk_frames(args.video_path, chunk_start, chunk_end, chunk_temp_dir)
+
+                # Load frames for visualization if needed
+                video_frames = None
+                if args.save_to_video:
+                    video_frames = load_chunk_frames_for_vis(args.video_path, chunk_start, chunk_end)
+                    print(f"[DEBUG] Loaded {len(video_frames)} frames for visualization")
+
+                # Process chunk with prediction
+                print(f"[DEBUG] Running tracking on chunk...")
+                chunk_results, next_prompts, video_frames = process_chunk(
+                    predictor, chunk_temp_dir, current_prompts, chunk_start,
+                    args.save_to_video, video_frames, height, width, cached_results
+                )
+
+                # Clean up chunk temp directory
+                shutil.rmtree(chunk_temp_dir)
 
             # Merge results
             all_results.update(chunk_results)
@@ -389,9 +516,6 @@ def main(args):
 
             # Update prompts for next chunk
             current_prompts = next_prompts
-
-            # Clean up chunk temp directory
-            shutil.rmtree(chunk_temp_dir)
 
             # Clean up GPU memory between chunks
             gc.collect()
@@ -442,9 +566,12 @@ def main(args):
     print("[DEBUG] Multi-object tracking completed successfully!")
     print(f"[DEBUG] Summary:")
     print(f"[DEBUG]   Objects tracked: {num_objects}")
-    print(f"[DEBUG]   Frame range: {start_frame} to {end_frame - 1}")
     print(f"[DEBUG]   Frames processed: {len(all_results)}")
     print(f"[DEBUG]   Chunks processed: {num_chunks}")
+    if chunks_skipped > 0:
+        print(f"[DEBUG]   Chunks skipped (from cache): {chunks_skipped}")
+    if cached_results:
+        print(f"[DEBUG]   Cache used: {args.cache_path} ({len(cached_results)} frames available)")
     if args.save_to_video:
         print(f"[DEBUG]   Output video: {args.video_output_path}")
         print(f"[DEBUG]   Frame images: {args.frame_output_path}/")
@@ -457,17 +584,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Multi-person tracking with SAMURAI (chunked processing for long videos)")
     parser.add_argument("--video_path", required=True, help="Input video path or directory of frames.")
     parser.add_argument("--txt_path", required=True, help="Path to bounding box file (one bbox per line).")
-    parser.add_argument("--bbox_format", default="xywh", choices=["xywh", "xyxy"],
-                        help="Bounding box format: 'xywh' for x,y,width,height or 'xyxy' for x1,y1,x2,y2 (default: xywh)")
+    parser.add_argument("--txt_bbox_format", default="xywh", choices=["xywh", "xyxy"],
+                        help="Bounding box format in txt file: 'xywh' for x,y,width,height or 'xyxy' for x1,y1,x2,y2 (default: xywh)")
     parser.add_argument("--model_path", default="sam2/checkpoints/sam2.1_hiera_base_plus.pt", help="Path to the model checkpoint.")
     parser.add_argument("--video_output_path", default="demo_multi.mp4", help="Path to save the output video.")
     parser.add_argument("--frame_output_path", default=None, help="Path to folder for saving output frame images. Defaults to 'frame_images' in same directory as video output.")
     parser.add_argument("--result_path", default=None, help="Path to save tracking results as JSON.")
+    parser.add_argument("--cache_path", default=None, help="Path to cache JSON file with pre-calculated results. Frames in cache will be used without prediction.")
     parser.add_argument("--save_to_video", type=lambda x: x.lower() == 'true', default=True, help="Save results to a video.")
     parser.add_argument("--chunk_size", type=int, default=DEFAULT_CHUNK_SIZE,
                         help=f"Number of frames per chunk for memory-efficient processing (default: {DEFAULT_CHUNK_SIZE}). "
                              "Lower values use less memory but may affect tracking continuity at chunk boundaries.")
-    parser.add_argument("--start_frame", type=int, default=0, help="Start frame index (inclusive, default: 0).")
-    parser.add_argument("--end_frame", type=int, default=None, help="End frame index (exclusive, default: None means process to end).")
     args = parser.parse_args()
     main(args)

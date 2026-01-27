@@ -1,14 +1,7 @@
 python scripts/demo_multi.py \
       --video_path ./demo/cortis_go/cortis_go_cut.mp4 \
       --txt_path ./demo/cortis_go/bbox_multi_0.txt \
-      --bbox_format xyxy \
+      --txt_bbox_format xyxy \
       --video_output_path ./demo/cortis_go/demo_multi.mp4 \
-      --result_path ./demo/cortis_go/cortis_go_positions.json 
-
-
-python scripts/demo_multi.py \
-      --video_path ./demo/cortis_go/cortis_go_cut.mp4 \
-      --txt_path ./demo/cortis_go/bbox_multi_2965.txt \
-      --video_output_path ./demo/cortis_go/demo_multi_2965.mp4 \
-      --result_path ./demo/cortis_go/cortis_go_positions_2965.json \
-      --start_frame 2965 --end_frame 3000
+      --result_path ./demo/cortis_go/cortis_go_result.json \
+      --cache_path ./demo/cortis_go/cortis_go_cache.json
