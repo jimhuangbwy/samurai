@@ -283,6 +283,8 @@ def main(args):
     print(f"[DEBUG]   csv_path: {args.csv_path}")
     print(f"[DEBUG]   save_to_video: {args.save_to_video}")
     print(f"[DEBUG]   chunk_size: {args.chunk_size}")
+    print(f"[DEBUG]   start_frame: {args.start_frame}")
+    print(f"[DEBUG]   end_frame: {args.end_frame}")
     print("-" * 60)
 
     print("\n[DEBUG] Step 1: Loading model configuration...")
@@ -303,10 +305,25 @@ def main(args):
     num_objects = len(prompts)
     print(f"\n[DEBUG] Step 5: Ready to track {num_objects} objects")
 
+    # Determine frame range to process
+    start_frame = args.start_frame
+    end_frame = args.end_frame if args.end_frame is not None else num_frames
+
+    # Validate frame range
+    if start_frame < 0:
+        start_frame = 0
+    if end_frame > num_frames:
+        end_frame = num_frames
+    if start_frame >= end_frame:
+        raise ValueError(f"Invalid frame range: start_frame ({start_frame}) must be less than end_frame ({end_frame})")
+
+    frames_to_process = end_frame - start_frame
+    print(f"[DEBUG] Frame range: {start_frame} to {end_frame - 1} ({frames_to_process} frames)")
+
     # Calculate chunks
     chunk_size = args.chunk_size
-    num_chunks = (num_frames + chunk_size - 1) // chunk_size
-    print(f"[DEBUG] Processing video in {num_chunks} chunks of up to {chunk_size} frames each")
+    num_chunks = (frames_to_process + chunk_size - 1) // chunk_size
+    print(f"[DEBUG] Processing in {num_chunks} chunks of up to {chunk_size} frames each")
     print("-" * 60)
 
     # Results storage: frame_idx -> {obj_id: bbox}
@@ -334,8 +351,8 @@ def main(args):
     current_prompts = prompts
     try:
         for chunk_idx in range(num_chunks):
-            chunk_start = chunk_idx * chunk_size
-            chunk_end = min((chunk_idx + 1) * chunk_size, num_frames)
+            chunk_start = start_frame + chunk_idx * chunk_size
+            chunk_end = min(start_frame + (chunk_idx + 1) * chunk_size, end_frame)
             chunk_frames_count = chunk_end - chunk_start
 
             print(f"\n[DEBUG] Processing chunk {chunk_idx + 1}/{num_chunks}: frames {chunk_start}-{chunk_end - 1} ({chunk_frames_count} frames)")
@@ -440,6 +457,7 @@ def main(args):
     print("[DEBUG] Multi-object tracking completed successfully!")
     print(f"[DEBUG] Summary:")
     print(f"[DEBUG]   Objects tracked: {num_objects}")
+    print(f"[DEBUG]   Frame range: {start_frame} to {end_frame - 1}")
     print(f"[DEBUG]   Frames processed: {len(all_results)}")
     print(f"[DEBUG]   Chunks processed: {num_chunks}")
     if args.save_to_video:
@@ -467,5 +485,7 @@ if __name__ == "__main__":
     parser.add_argument("--chunk_size", type=int, default=DEFAULT_CHUNK_SIZE,
                         help=f"Number of frames per chunk for memory-efficient processing (default: {DEFAULT_CHUNK_SIZE}). "
                              "Lower values use less memory but may affect tracking continuity at chunk boundaries.")
+    parser.add_argument("--start_frame", type=int, default=0, help="Start frame index (inclusive, default: 0).")
+    parser.add_argument("--end_frame", type=int, default=None, help="End frame index (exclusive, default: None means process to end).")
     args = parser.parse_args()
     main(args)
