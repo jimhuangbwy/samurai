@@ -32,3 +32,12 @@ python scripts/demo_multi.py \
       --result_path ./demo/cortis_go/cortis_go_bbox_result_3495.json \
       --cache_path ./demo/cortis_go/cortis_go_cache.json \
       --start_frame 3495
+
+
+python scripts/review_gui.py \
+      --video_path ./demo/cortis_go/cortis_go_cut.mp4 \
+      --cache_path ./demo/cortis_go/cortis_go_cache.json
+
+python scripts/review_gui.py \
+      --video_path ./demo/spaghetti_fix/spaghetti_fix.mp4 \
+      --cache_path ./demo/spaghetti_fix/spaghetti_fix_cache.json
