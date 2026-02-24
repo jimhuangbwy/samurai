@@ -481,7 +481,8 @@ class SAM2Base(torch.nn.Module):
                         kf_mean, kf_cov = self.kf.update(kf_mean, kf_cov, self.kf.xyxy_to_xyah(high_res_bbox))
                         self.stable_frames_per_obj[obj_idx] = stable_frames + 1
                     else:
-                        self.stable_frames_per_obj[obj_idx] = 0
+                        # Gradual decay instead of hard reset to survive prolonged occlusions
+                        self.stable_frames_per_obj[obj_idx] = max(0, stable_frames - 1)
 
                     self.kf_means[obj_idx] = kf_mean
                     self.kf_covariances[obj_idx] = kf_cov
@@ -509,7 +510,8 @@ class SAM2Base(torch.nn.Module):
 
                     # Update KF state
                     if obj_ious[best_iou_idx].item() < self.stable_ious_threshold:
-                        self.stable_frames_per_obj[obj_idx] = 0
+                        # Gradual decay instead of hard reset to survive prolonged occlusions
+                        self.stable_frames_per_obj[obj_idx] = max(0, stable_frames - 1)
                     else:
                         kf_mean, kf_cov = self.kf.update(kf_mean, kf_cov, self.kf.xyxy_to_xyah(high_res_multibboxes[best_iou_idx]))
 

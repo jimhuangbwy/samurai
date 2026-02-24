@@ -393,6 +393,11 @@ def main(args):
     print("\n[DEBUG] Step 2: Building SAM2 video predictor...")
     print(f"[DEBUG] Using device: cuda:0")
     predictor = build_sam2_video_predictor(model_cfg, args.model_path, device="cuda:0")
+    # Tuned for prolonged person-overlap scenarios (60+ frames)
+    predictor.stable_ious_threshold = 0.1
+    predictor.kf_score_weight = 0.55
+    predictor.memory_bank_iou_threshold = 0.2
+    predictor.stable_frames_threshold = 25
     print("[DEBUG] Predictor built successfully")
 
     print("\n[DEBUG] Step 3: Getting video information...")

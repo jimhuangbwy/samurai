@@ -6,7 +6,6 @@ python scripts/demo_multi.py \
       --result_path ./demo/cortis_go/cortis_go_bbox_result.json \
       --cache_path ./demo/cortis_go/cortis_go_cache.json
 
-
 python scripts/demo_multi.py \
       --video_path ./demo/cortis_go/cortis_go_cut.mp4 \
       --txt_path ./demo/cortis_go/bbox_multi_2967.txt \
@@ -14,7 +13,6 @@ python scripts/demo_multi.py \
       --result_path ./demo/cortis_go/cortis_go_bbox_result_2967.json \
       --cache_path ./demo/cortis_go/cortis_go_cache.json \
       --start_frame 2967 --end_frame 3000
-
 
 python scripts/demo_multi.py \
       --video_path ./demo/cortis_go/cortis_go_cut.mp4 \
@@ -24,7 +22,6 @@ python scripts/demo_multi.py \
       --cache_path ./demo/cortis_go/cortis_go_cache.json \
       --start_frame 2981 --end_frame 3020      
 
-
 python scripts/demo_multi.py \
       --video_path ./demo/cortis_go/cortis_go_cut.mp4 \
       --txt_path ./demo/cortis_go/bbox_multi_3495.txt \
@@ -33,10 +30,10 @@ python scripts/demo_multi.py \
       --cache_path ./demo/cortis_go/cortis_go_cache.json \
       --start_frame 3495
 
-
 python scripts/review_gui.py \
       --video_path ./demo/cortis_go/cortis_go_cut.mp4 \
       --cache_path ./demo/cortis_go/cortis_go_cache.json
+
 
 python scripts/review_gui.py \
       --video_path ./demo/spaghetti_fix/spaghetti_fix.mp4 \
