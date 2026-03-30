@@ -38,3 +38,7 @@ python scripts/review_gui.py \
 python scripts/review_gui.py \
       --video_path ./demo/spaghetti_fix/spaghetti_fix.mp4 \
       --cache_path ./demo/spaghetti_fix/spaghetti_fix_cache.json
+
+python scripts/review_gui.py \
+      --video_path ./demo/cortis_fashion/cortis_fashion_cut.mp4 \
+      --cache_path ./demo/cortis_fashion/cortis_fashion_cache.json

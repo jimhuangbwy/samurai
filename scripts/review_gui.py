@@ -159,6 +159,10 @@ class TrackingData:
 # ---------------------------------------------------------------------------
 # CanvasView: frame display + bbox overlays + drawing
 # ---------------------------------------------------------------------------
+HANDLE_HIT_SIZE = 10   # pixels: corner hit-detection radius
+HANDLE_DRAW_SIZE = 6   # pixels: half-size of drawn corner square
+
+
 class CanvasView(tk.Canvas):
     """Canvas that displays a video frame with bbox overlays and supports drawing."""
 
@@ -182,6 +186,16 @@ class CanvasView(tk.Canvas):
         self._drag_rect_id = None
         self._on_correction_change = on_correction_change
 
+        # Interaction state for resize/move of existing correction boxes
+        self._interact_mode = None    # 'draw', 'resize', or 'move'
+        self._interact_obj_id = None
+        self._resize_handle = None    # 'nw', 'ne', 'sw', 'se'
+        self._resize_orig_bbox = None
+        self._move_orig_bbox = None
+
+        # Playback state (set by ReviewApp; suppresses handles during playback)
+        self.is_playing = False
+
         # Pan state
         self._pan_start = None
 
@@ -189,6 +203,7 @@ class CanvasView(tk.Canvas):
         self.bind("<ButtonPress-1>", self._on_press)
         self.bind("<B1-Motion>", self._on_drag)
         self.bind("<ButtonRelease-1>", self._on_release)
+        self.bind("<Motion>", self._on_motion)
         self.bind("<Configure>", self._on_resize)
         # Zoom
         self.bind("<Button-4>", self._on_scroll_up)
@@ -251,7 +266,8 @@ class CanvasView(tk.Canvas):
             if obj_id in self.pending_corrections:
                 self._draw_bbox(bbox, obj_id, eff_scale, img_left, img_top, style="faded")
             else:
-                self._draw_bbox(bbox, obj_id, eff_scale, img_left, img_top, style="solid")
+                style = "solid" if self.is_playing else "solid_interactive"
+                self._draw_bbox(bbox, obj_id, eff_scale, img_left, img_top, style=style)
 
         # Draw pending corrections
         for obj_id, bbox in self.pending_corrections.items():
@@ -267,16 +283,64 @@ class CanvasView(tk.Canvas):
 
         if style == "solid":
             self.create_rectangle(cx1, cy1, cx2, cy2, outline=color, width=2)
+        elif style == "solid_interactive":
+            self.create_rectangle(cx1, cy1, cx2, cy2, outline=color, width=2)
+            hs = HANDLE_DRAW_SIZE
+            for hx, hy in [(cx1, cy1), (cx2, cy1), (cx1, cy2), (cx2, cy2)]:
+                self.create_rectangle(hx - hs, hy - hs, hx + hs, hy + hs,
+                                      fill=color, outline="white", width=1)
         elif style == "faded":
             self.create_rectangle(cx1, cy1, cx2, cy2, outline=color, width=1, dash=(4, 4))
         elif style == "correction":
             self.create_rectangle(cx1, cy1, cx2, cy2, outline=color, width=3, dash=(6, 3))
+            # Draw corner handles
+            hs = HANDLE_DRAW_SIZE
+            for hx, hy in [(cx1, cy1), (cx2, cy1), (cx1, cy2), (cx2, cy2)]:
+                self.create_rectangle(hx - hs, hy - hs, hx + hs, hy + hs,
+                                      fill=color, outline="white", width=1)
 
         # Label
         label = f"ID:{obj_id}"
         font_size = max(8, int(10 * scale / self.fit_scale)) if self.fit_scale > 0 else 10
         self.create_text(cx1 + 4, cy1 - 4, text=label, fill=color,
                          anchor="sw", font=("Helvetica", font_size, "bold"))
+
+    def _bbox_canvas(self, bbox_xywh):
+        """Convert image-space [x,y,w,h] to canvas-space (cx1,cy1,cx2,cy2)."""
+        x, y, w, h = bbox_xywh
+        eff_scale = self.fit_scale * self.zoom_level
+        img_left, img_top = self._get_image_origin()
+        return (img_left + x * eff_scale, img_top + y * eff_scale,
+                img_left + (x + w) * eff_scale, img_top + (y + h) * eff_scale)
+
+    def _find_interaction(self, canvas_x, canvas_y):
+        """Return (obj_id, itype, handle) for whichever bbox is under the cursor.
+        Corrections are checked first; predicted bboxes are checked when not playing.
+        itype: 'corner'/'move' for corrections, 'corner_predicted'/'move_predicted'
+        for predicted boxes. handle is 'nw'/'ne'/'sw'/'se' or None."""
+        HIT = HANDLE_HIT_SIZE
+        for obj_id, bbox in self.pending_corrections.items():
+            cx1, cy1, cx2, cy2 = self._bbox_canvas(bbox)
+            corners = {'nw': (cx1, cy1), 'ne': (cx2, cy1),
+                       'sw': (cx1, cy2), 'se': (cx2, cy2)}
+            for handle, (hx, hy) in corners.items():
+                if abs(canvas_x - hx) <= HIT and abs(canvas_y - hy) <= HIT:
+                    return obj_id, 'corner', handle
+            if cx1 <= canvas_x <= cx2 and cy1 <= canvas_y <= cy2:
+                return obj_id, 'move', None
+        if not self.is_playing:
+            for obj_id, bbox in self.predicted_bboxes.items():
+                if obj_id in self.pending_corrections:
+                    continue
+                cx1, cy1, cx2, cy2 = self._bbox_canvas(bbox)
+                corners = {'nw': (cx1, cy1), 'ne': (cx2, cy1),
+                           'sw': (cx1, cy2), 'se': (cx2, cy2)}
+                for handle, (hx, hy) in corners.items():
+                    if abs(canvas_x - hx) <= HIT and abs(canvas_y - hy) <= HIT:
+                        return obj_id, 'corner_predicted', handle
+                if cx1 <= canvas_x <= cx2 and cy1 <= canvas_y <= cy2:
+                    return obj_id, 'move_predicted', None
+        return None, None, None
 
     def _canvas_to_image_coords(self, canvas_x, canvas_y):
         eff_scale = self.fit_scale * self.zoom_level
@@ -286,43 +350,130 @@ class CanvasView(tk.Canvas):
         return int(round(ix)), int(round(iy))
 
     def _on_press(self, event):
-        if not self.draw_mode or self.pil_image is None:
+        if self.pil_image is None:
             return
-        self._drag_start = (event.x, event.y)
+        obj_id, itype, handle = self._find_interaction(event.x, event.y)
+        if itype in ('corner_predicted', 'move_predicted'):
+            # Promote predicted bbox to a correction, then interact with it
+            self.pending_corrections[obj_id] = list(self.predicted_bboxes[obj_id])
+            self._redraw()
+            itype = 'corner' if itype == 'corner_predicted' else 'move'
+        if itype == 'corner':
+            self._interact_mode = 'resize'
+            self._interact_obj_id = obj_id
+            self._resize_handle = handle
+            self._resize_orig_bbox = list(self.pending_corrections[obj_id])
+            self._drag_start = (event.x, event.y)
+        elif itype == 'move':
+            self._interact_mode = 'move'
+            self._interact_obj_id = obj_id
+            self._move_orig_bbox = list(self.pending_corrections[obj_id])
+            self._drag_start = (event.x, event.y)
+        elif self.draw_mode:
+            self._interact_mode = 'draw'
+            self._drag_start = (event.x, event.y)
+        else:
+            self._interact_mode = None
+            self._drag_start = None
 
     def _on_drag(self, event):
-        if self._drag_start is None:
+        if self._drag_start is None or self._interact_mode is None:
             return
-        if self._drag_rect_id:
-            self.delete(self._drag_rect_id)
-        color = COLORS_HEX[self.selected_obj_id % len(COLORS_HEX)]
-        self._drag_rect_id = self.create_rectangle(
-            self._drag_start[0], self._drag_start[1], event.x, event.y,
-            outline=color, width=2, dash=(4, 2))
+        if self._interact_mode == 'draw':
+            if self._drag_rect_id:
+                self.delete(self._drag_rect_id)
+            color = COLORS_HEX[self.selected_obj_id % len(COLORS_HEX)]
+            self._drag_rect_id = self.create_rectangle(
+                self._drag_start[0], self._drag_start[1], event.x, event.y,
+                outline=color, width=2, dash=(4, 2))
+        elif self._interact_mode == 'resize':
+            self._update_resize(event.x, event.y)
+        elif self._interact_mode == 'move':
+            self._update_move(event.x, event.y)
+
+    def _update_resize(self, canvas_x, canvas_y):
+        """Recompute the correction bbox while dragging a corner handle."""
+        obj_id = self._interact_obj_id
+        ox, oy, ow, oh = self._resize_orig_bbox
+        ox1, oy1, ox2, oy2 = ox, oy, ox + ow, oy + oh
+        ix, iy = self._canvas_to_image_coords(canvas_x, canvas_y)
+        handle = self._resize_handle
+        if handle == 'nw':
+            nx1, ny1, nx2, ny2 = ix, iy, ox2, oy2
+        elif handle == 'ne':
+            nx1, ny1, nx2, ny2 = ox1, iy, ix, oy2
+        elif handle == 'sw':
+            nx1, ny1, nx2, ny2 = ix, oy1, ox2, iy
+        else:  # 'se'
+            nx1, ny1, nx2, ny2 = ox1, oy1, ix, iy
+        x1, x2 = min(nx1, nx2), max(nx1, nx2)
+        y1, y2 = min(ny1, ny2), max(ny1, ny2)
+        img_w, img_h = self.pil_image.size
+        x1 = max(0, min(x1, img_w))
+        y1 = max(0, min(y1, img_h))
+        x2 = max(0, min(x2, img_w))
+        y2 = max(0, min(y2, img_h))
+        if x2 - x1 >= 1 and y2 - y1 >= 1:
+            self.pending_corrections[obj_id] = [x1, y1, x2 - x1, y2 - y1]
+            self._redraw()
+
+    def _update_move(self, canvas_x, canvas_y):
+        """Translate the correction bbox while dragging its interior."""
+        obj_id = self._interact_obj_id
+        ox, oy, ow, oh = self._move_orig_bbox
+        start_ix, start_iy = self._canvas_to_image_coords(self._drag_start[0], self._drag_start[1])
+        cur_ix, cur_iy = self._canvas_to_image_coords(canvas_x, canvas_y)
+        img_w, img_h = self.pil_image.size
+        nx = max(0, min(ox + cur_ix - start_ix, img_w - ow))
+        ny = max(0, min(oy + cur_iy - start_iy, img_h - oh))
+        self.pending_corrections[obj_id] = [nx, ny, ow, oh]
+        self._redraw()
 
     def _on_release(self, event):
         if self._drag_start is None:
             return
-        if self._drag_rect_id:
-            self.delete(self._drag_rect_id)
-            self._drag_rect_id = None
-        ix1, iy1 = self._canvas_to_image_coords(self._drag_start[0], self._drag_start[1])
-        ix2, iy2 = self._canvas_to_image_coords(event.x, event.y)
-        x1, x2 = min(ix1, ix2), max(ix1, ix2)
-        y1, y2 = min(iy1, iy2), max(iy1, iy2)
-        # Clamp to image bounds
-        x1 = max(0, x1)
-        y1 = max(0, y1)
-        x2 = min(self.pil_image.width, x2)
-        y2 = min(self.pil_image.height, y2)
-        w, h = x2 - x1, y2 - y1
+        if self._interact_mode == 'draw':
+            if self._drag_rect_id:
+                self.delete(self._drag_rect_id)
+                self._drag_rect_id = None
+            ix1, iy1 = self._canvas_to_image_coords(self._drag_start[0], self._drag_start[1])
+            ix2, iy2 = self._canvas_to_image_coords(event.x, event.y)
+            x1, x2 = min(ix1, ix2), max(ix1, ix2)
+            y1, y2 = min(iy1, iy2), max(iy1, iy2)
+            x1 = max(0, x1)
+            y1 = max(0, y1)
+            x2 = min(self.pil_image.width, x2)
+            y2 = min(self.pil_image.height, y2)
+            w, h = x2 - x1, y2 - y1
+            if w >= 5 and h >= 5:
+                self.pending_corrections[self.selected_obj_id] = [x1, y1, w, h]
+                self._redraw()
+                if self._on_correction_change:
+                    self._on_correction_change()
+        elif self._interact_mode in ('resize', 'move'):
+            if self._on_correction_change:
+                self._on_correction_change()
+
         self._drag_start = None
-        if w < 5 or h < 5:
-            return
-        self.pending_corrections[self.selected_obj_id] = [x1, y1, w, h]
-        self._redraw()
-        if self._on_correction_change:
-            self._on_correction_change()
+        self._interact_mode = None
+        self._interact_obj_id = None
+        self._resize_handle = None
+
+    def _on_motion(self, event):
+        """Update cursor based on what the mouse is hovering over."""
+        if self._drag_start is not None:
+            return  # Don't change cursor mid-drag
+        obj_id, itype, handle = self._find_interaction(event.x, event.y)
+        if itype in ('corner', 'corner_predicted'):
+            cursor_map = {'nw': 'top_left_corner', 'ne': 'top_right_corner',
+                          'sw': 'bottom_left_corner', 'se': 'bottom_right_corner'}
+            self.config(cursor=cursor_map[handle])
+        elif itype in ('move', 'move_predicted'):
+            self.config(cursor='fleur')
+        elif self.draw_mode:
+            self.config(cursor='crosshair')
+        else:
+            self.config(cursor='')
 
     def _on_resize(self, event):
         self._compute_fit_scale()
@@ -831,6 +982,7 @@ class ReviewApp(tk.Tk):
 
     def _toggle_play(self):
         self.is_playing = not self.is_playing
+        self.canvas_view.is_playing = self.is_playing
         self.play_btn.config(text="Stop" if self.is_playing else "Play")
         if self.is_playing:
             self._play_tick()
@@ -843,6 +995,7 @@ class ReviewApp(tk.Tk):
             self.after(33, self._play_tick)  # ~30fps
         else:
             self.is_playing = False
+            self.canvas_view.is_playing = False
             self.play_btn.config(text="Play")
 
     # --- Object & Drawing ---
