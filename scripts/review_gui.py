@@ -317,17 +317,24 @@ class CanvasView(tk.Canvas):
         """Return (obj_id, itype, handle) for whichever bbox is under the cursor.
         Corrections are checked first; predicted bboxes are checked when not playing.
         itype: 'corner'/'move' for corrections, 'corner_predicted'/'move_predicted'
-        for predicted boxes. handle is 'nw'/'ne'/'sw'/'se' or None."""
+        for predicted boxes. handle is 'nw'/'ne'/'sw'/'se' or None.
+        When multiple boxes overlap, the selected_obj_id is preferred so the user
+        can reach a box that is behind another."""
         HIT = HANDLE_HIT_SIZE
+        matches = []  # [(obj_id, itype, handle), ...]
+
         for obj_id, bbox in self.pending_corrections.items():
             cx1, cy1, cx2, cy2 = self._bbox_canvas(bbox)
             corners = {'nw': (cx1, cy1), 'ne': (cx2, cy1),
                        'sw': (cx1, cy2), 'se': (cx2, cy2)}
             for handle, (hx, hy) in corners.items():
                 if abs(canvas_x - hx) <= HIT and abs(canvas_y - hy) <= HIT:
-                    return obj_id, 'corner', handle
-            if cx1 <= canvas_x <= cx2 and cy1 <= canvas_y <= cy2:
-                return obj_id, 'move', None
+                    matches.append((obj_id, 'corner', handle))
+                    break
+            else:
+                if cx1 <= canvas_x <= cx2 and cy1 <= canvas_y <= cy2:
+                    matches.append((obj_id, 'move', None))
+
         if not self.is_playing:
             for obj_id, bbox in self.predicted_bboxes.items():
                 if obj_id in self.pending_corrections:
@@ -337,10 +344,19 @@ class CanvasView(tk.Canvas):
                            'sw': (cx1, cy2), 'se': (cx2, cy2)}
                 for handle, (hx, hy) in corners.items():
                     if abs(canvas_x - hx) <= HIT and abs(canvas_y - hy) <= HIT:
-                        return obj_id, 'corner_predicted', handle
-                if cx1 <= canvas_x <= cx2 and cy1 <= canvas_y <= cy2:
-                    return obj_id, 'move_predicted', None
-        return None, None, None
+                        matches.append((obj_id, 'corner_predicted', handle))
+                        break
+                else:
+                    if cx1 <= canvas_x <= cx2 and cy1 <= canvas_y <= cy2:
+                        matches.append((obj_id, 'move_predicted', None))
+
+        if not matches:
+            return None, None, None
+        # Prefer the currently selected object so overlapping boxes are reachable
+        for item in matches:
+            if item[0] == self.selected_obj_id:
+                return item
+        return matches[0]
 
     def _canvas_to_image_coords(self, canvas_x, canvas_y):
         eff_scale = self.fit_scale * self.zoom_level
@@ -732,6 +748,7 @@ class ReviewApp(tk.Tk):
         self._build_canvas()
         self._build_nav_bar()
         self._build_object_panel()
+        self._build_interpolate_panel()
         self._build_action_bar()
         self._bind_keys()
 
@@ -829,6 +846,43 @@ class ReviewApp(tk.Tk):
         self.corrections_label = tk.Label(row2, text="(none)", fg="gray")
         self.corrections_label.pack(side=tk.LEFT, padx=5)
 
+    # --- Interpolation Panel ---
+    def _build_interpolate_panel(self):
+        panel = tk.LabelFrame(self, text="Interpolate Bboxes Between Frames")
+        panel.pack(fill=tk.X, padx=5, pady=2)
+
+        row = tk.Frame(panel)
+        row.pack(fill=tk.X, padx=5, pady=3)
+
+        tk.Label(row, text="Object ID:").pack(side=tk.LEFT)
+        self.interp_obj_id_var = tk.IntVar(value=0)
+        self.interp_obj_id_spin = tk.Spinbox(row, from_=0, to=9, width=4,
+                                              textvariable=self.interp_obj_id_var)
+        self.interp_obj_id_spin.pack(side=tk.LEFT, padx=(2, 15))
+
+        tk.Label(row, text="Start frame:").pack(side=tk.LEFT)
+        self.interp_start_entry = tk.Entry(row, width=7)
+        self.interp_start_entry.pack(side=tk.LEFT, padx=2)
+        tk.Button(row, text="Set", width=3,
+                  command=lambda: self._interp_set_frame(self.interp_start_entry)).pack(side=tk.LEFT, padx=(0, 10))
+
+        tk.Label(row, text="End frame:").pack(side=tk.LEFT)
+        self.interp_end_entry = tk.Entry(row, width=7)
+        self.interp_end_entry.pack(side=tk.LEFT, padx=2)
+        tk.Button(row, text="Set", width=3,
+                  command=lambda: self._interp_set_frame(self.interp_end_entry)).pack(side=tk.LEFT, padx=(0, 15))
+
+        tk.Button(row, text="Interpolate", command=self._on_interpolate,
+                  bg="#FF9800", fg="white", font=("Helvetica", 10, "bold")).pack(side=tk.LEFT, padx=5)
+
+        self.interp_status_label = tk.Label(row, text="", fg="gray")
+        self.interp_status_label.pack(side=tk.LEFT, padx=10)
+
+    def _interp_set_frame(self, entry):
+        """Fill an interpolation frame entry with the current frame index."""
+        entry.delete(0, tk.END)
+        entry.insert(0, str(self.current_frame_idx))
+
     # --- Action Bar ---
     def _build_action_bar(self):
         action = tk.Frame(self)
@@ -838,6 +892,11 @@ class ReviewApp(tk.Tk):
                                         command=self._on_apply_corrections,
                                         bg="#4CAF50", fg="white", font=("Helvetica", 10, "bold"))
         self.reprocess_btn.pack(side=tk.LEFT, padx=5)
+
+        self.save_bbox_btn = tk.Button(action, text="Save Bboxes to Cache",
+                                       command=self._on_save_bboxes_to_cache,
+                                       bg="#2196F3", fg="white", font=("Helvetica", 10, "bold"))
+        self.save_bbox_btn.pack(side=tk.LEFT, padx=5)
 
         tk.Label(action, text="End frame (optional):").pack(side=tk.LEFT, padx=(20, 2))
         self.end_frame_entry = tk.Entry(action, width=8)
@@ -1116,6 +1175,104 @@ class ReviewApp(tk.Tk):
                 self.obj_id_spin.config(to=num_objects - 1)
             self._show_frame(frame_idx)
             self.status_label.config(text="Reprocessing complete", fg="green")
+
+    def _on_interpolate(self):
+        try:
+            start_frame = int(self.interp_start_entry.get())
+            end_frame = int(self.interp_end_entry.get())
+        except ValueError:
+            messagebox.showerror("Error", "Start and end frame must be integers.")
+            return
+
+        obj_id = self.interp_obj_id_var.get()
+
+        if start_frame >= end_frame:
+            messagebox.showerror("Error", "Start frame must be less than end frame.")
+            return
+        if end_frame - start_frame < 2:
+            messagebox.showinfo("Nothing to do", "No frames between start and end to interpolate.")
+            return
+
+        # Resolve start bbox: prefer pending correction on that frame, else cache
+        def get_bbox(frame_idx):
+            if frame_idx == self.current_frame_idx:
+                if obj_id in self.canvas_view.pending_corrections:
+                    return self.canvas_view.pending_corrections[obj_id]
+            data = self.tracking_data.get_frame_data(frame_idx)
+            if data and obj_id in data:
+                return data[obj_id]["bbox"]
+            return None
+
+        start_bbox = get_bbox(start_frame)
+        end_bbox = get_bbox(end_frame)
+
+        if start_bbox is None:
+            messagebox.showerror("Error",
+                f"No bbox for object {obj_id} at start frame {start_frame}.")
+            return
+        if end_bbox is None:
+            messagebox.showerror("Error",
+                f"No bbox for object {obj_id} at end frame {end_frame}.")
+            return
+
+        span = end_frame - start_frame
+        count = 0
+        for frame_idx in range(start_frame + 1, end_frame):
+            t = (frame_idx - start_frame) / span
+            bbox = [start_bbox[i] + t * (end_bbox[i] - start_bbox[i]) for i in range(4)]
+            x, y, w, h = bbox
+            if frame_idx not in self.tracking_data.frames:
+                self.tracking_data.frames[frame_idx] = {}
+            self.tracking_data.frames[frame_idx][obj_id] = {
+                "bbox": bbox,
+                "center": [x + w / 2, y + h / 2],
+            }
+            count += 1
+
+        if self.cache_path:
+            self.tracking_data.save(self.cache_path)
+            saved_msg = f", saved to cache"
+        else:
+            saved_msg = " (cache not saved — use File > Save Cache)"
+
+        self._show_frame(self.current_frame_idx)
+        self.interp_status_label.config(
+            text=f"Interpolated {count} frames for object {obj_id}{saved_msg}", fg="green")
+
+    def _on_save_bboxes_to_cache(self):
+        corrections = dict(self.canvas_view.pending_corrections)
+        if not corrections:
+            messagebox.showwarning("No Corrections", "No corrected bboxes to save.")
+            return
+        if not self.cache_path:
+            path = filedialog.asksaveasfilename(
+                title="Save cache as...",
+                defaultextension=".json",
+                filetypes=[("JSON files", "*.json")])
+            if not path:
+                return
+            self.cache_path = path
+
+        frame_idx = self.current_frame_idx
+        if frame_idx not in self.tracking_data.frames:
+            self.tracking_data.frames[frame_idx] = {}
+
+        for obj_id, bbox in corrections.items():
+            x, y, w, h = bbox
+            self.tracking_data.frames[frame_idx][obj_id] = {
+                "bbox": bbox,
+                "center": [x + w / 2, y + h / 2],
+            }
+            # Keep num_objects in sync
+            if obj_id >= self.tracking_data.num_objects:
+                self.tracking_data.num_objects = obj_id + 1
+                self.obj_id_spin.config(to=obj_id)
+
+        self.tracking_data.save(self.cache_path)
+        self.canvas_view.pending_corrections.clear()
+        self._show_frame(frame_idx)
+        self.status_label.config(
+            text=f"Saved {len(corrections)} bbox(es) to cache (frame {frame_idx})", fg="green")
 
     # --- Cleanup ---
     def _on_close(self):
